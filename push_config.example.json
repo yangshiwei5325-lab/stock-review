@@ -1,0 +1,42 @@
+{
+  "feishu_app": {
+    "_怎么拿": "飞书开放平台 open.feishu.cn -> 创建企业自建应用 -> 凭证与基础信息里拿 app_id / app_secret", 
+    "_权限": "应用需开通 im:message 权限，并被管理员发布到企业内", 
+    "app_secret": "", 
+    "app_id": "", 
+    "_发给谁": "receive_id_type 可选 open_id / user_id / union_id / email / chat_id；receive_id 填对应值", 
+    "receive_id": "", 
+    "receive_id_type": "open_id"
+  }, 
+  "_用法": "改 provider 选渠道，只填该渠道的凭据即可。凭据留空 = 视为未配置，推送会明确提示。", 
+  "custom": {
+    "url": "", 
+    "headers": {}, 
+    "body": {
+      "card": {
+        "elements": [
+          {
+            "text": {
+              "content": "{{content}}", 
+              "tag": "lark_md"
+            }, 
+            "tag": "div"
+          }
+        ]
+      }, 
+      "msg_type": "interactive"
+    }, 
+    "_说明": "任意 webhook，POST JSON；body 内 {{title}} / {{content}} 会被替换"
+  }, 
+  "feishu": {
+    "_怎么拿": "飞书 -> 打开任意群 -> 右上角 设置 -> 群机器人 -> 添加机器人 -> 自定义机器人 -> 复制 Webhook 地址", 
+    "secret": "", 
+    "webhook": "", 
+    "_签名校验": "如果创建机器人时勾选了「签名校验」，把密钥填到 secret；没勾就留空", 
+    "title": ""
+  }, 
+  "provider": "feishu", 
+  "_only_if可选值": "always（每天都推）| pressure（偏空信号>=3条才推）| bigmove（上证涨跌幅>=1%才推）", 
+  "only_if": "always", 
+  "once_per_day": false
+}

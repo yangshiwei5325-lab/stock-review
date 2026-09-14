@@ -1,0 +1,17 @@
+# ---- 凭据：绝不入库 ----
+push_config.json
+
+# ---- 生成物 ----
+reports/
+.cache/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
