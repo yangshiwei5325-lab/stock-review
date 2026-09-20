@@ -6,10 +6,14 @@
 stock-review/
 ├── 一键复盘.bat            ← Windows 双击运行
 ├── 一键复盘并推送.bat      ← Windows 双击运行（顺手推到飞书）
+├── 每日复盘推送.bat        ← 定时任务调用的入口（生成 + 推送 + 记日志）
 ├── run.sh                  ← Linux / macOS
 ├── stock_review.py         ← 主程序（Python 2.7 / 3.x 均可）
 ├── feishu_push.py          ← 飞书推送模块（也可单独当命令行工具）
-├── push_config.json        ← 飞书推送配置（需自己填）
+├── selftest.py             ← 离线自检（不联网，改代码后先跑它）
+├── setup_task.ps1          ← 注册 Windows 定时任务
+├── push_config.json        ← 飞书推送配置（需自己填，已被 .gitignore 排除）
+├── push_config.example.json← 配置模板（入库的那份，凭据留空）
 ├── reports/                ← 生成的报告（.md + .summary.json）
 └── .cache/<交易日>/        ← 原始数据缓存（可断点续跑，可随时删）
 ```
@@ -258,9 +262,37 @@ python feishu_push.py --test --dry-run                 # 自检，不发送
 
 **多主机容错**：东财行情主机有多台备机，脚本会记住最近可用的那台；该主机失效时自动回退到全量探测。
 
-**并发抓取**：板块、资金、日K、全市场分页均并发执行，`--workers` 可调（默认 8）。
+**并发抓取**：板块、资金、日K、全市场分页、新闻各页，以及主力资金/两融/涨跌停池/外围/商品这 5 个互相独立的源，均并发执行，`--workers` 可调（默认 8）。
 
 **部分失败不影响出报告**：任一接口挂掉只会在"数据缺口"里记一笔，其余章节照常生成。
+
+---
+
+## 自检（改代码后先跑这个）
+
+```bash
+python selftest.py
+```
+
+不联网、不到 1 秒，用构造数据跑一遍核心纯计算与渲染路径，覆盖：
+
+- `analyze()` 的统计口径（涨跌家数、涨跌幅分布桶边界、中位数/均值、TOP-N 排序）
+- `build_signals()` 多空信号与关键点位
+- `render()` 报告渲染（章节齐全、个股三榜、新闻关键词过滤）
+- `build_summary()` 推送摘要结构
+- `parse_sina_lines()` 新浪行情文本解析
+- `fetch_all_sources()` 并发取数的失败隔离
+- `feishu_push` 卡片渲染、占位符替换（含制表符等控制字符）、错误码解析
+
+改动渲染或统计逻辑后，除了跑自检，还可以做一次**逐字节回归**：拿同一份 `.cache/<交易日>/` 缓存，分别用改动前后两版脚本离线跑一遍，比对报告：
+
+```bash
+python stock_review.py --date 20260918 --out /tmp/new.md   # 改后
+python old_stock_review.py --date 20260918 --cache-dir ./.cache/2026-09-18 --out /tmp/old.md  # 改前
+diff /tmp/old.md /tmp/new.md
+```
+
+> `--date` 离线模式只读缓存、不联网、不写缓存，所以安全且可重复。
 
 ---
 

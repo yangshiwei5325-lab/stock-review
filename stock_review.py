@@ -24,7 +24,7 @@ A股每日复盘一键脚本  (stock_review.py)
 数据来源：东方财富 / 新浪财经 公开行情接口。
 """
 
-from __future__ import print_function, unicode_literals
+from __future__ import print_function, unicode_literals, division
 
 import os
 import sys
@@ -32,12 +32,17 @@ import json
 import math
 import time
 import codecs
+import numbers
 import argparse
 import datetime
 import threading
+import collections
+import heapq
+import re
 
 # ---------------------------------------------------------------- py2/py3 兼容
 PY3 = sys.version_info[0] >= 3
+NUM_TYPES = (int, float, long) if not PY3 else (int, float)
 if PY3:
     from urllib.request import Request, urlopen
 else:
@@ -114,10 +119,12 @@ NEWS_KEYWORDS = [
 
 ERRORS = []          # 记录失败的数据源，最后写进报告的"数据缺口"
 OFFLINE = [False]    # True = 只读本地缓存，不发起网络请求（离线复盘）
+_IO_LOCK = threading.Lock()   # 并发抓取时保证控制台输出不串行错乱
 
 
 def log(msg):
-    print('[%s] %s' % (datetime.datetime.now().strftime('%H:%M:%S'), msg))
+    with _IO_LOCK:
+        print('[%s] %s' % (datetime.datetime.now().strftime('%H:%M:%S'), msg))
 
 
 def is_trading_session(now):
@@ -130,12 +137,13 @@ def is_trading_session(now):
 
 def warn(msg):
     ERRORS.append(msg)
-    print('[!] %s' % msg)
+    with _IO_LOCK:
+        print('[!] %s' % msg)
 
 
 # ================================================================ HTTP 基础
-def http_get(url, referer=None, timeout=25, retries=4, encoding='utf-8', quiet=False):
-    """带重试的 GET，返回解码后的文本。"""
+def http_get(url, referer=None, timeout=25, retries=4, encoding='utf-8'):
+    """带重试的 GET，返回解码后的文本（最后一次失败后不再无谓等待）。"""
     headers = {'User-Agent': UA, 'Accept': '*/*'}
     if referer:
         headers['Referer'] = referer
@@ -143,11 +151,18 @@ def http_get(url, referer=None, timeout=25, retries=4, encoding='utf-8', quiet=F
     for i in range(retries):
         try:
             resp = urlopen(Request(url, headers=headers), timeout=timeout)
-            raw = resp.read()
+            try:
+                raw = resp.read()
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             return raw.decode(encoding, 'ignore')
         except Exception as e:
             last = e
-            time.sleep(0.5 * (i + 1))
+            if i < retries - 1:          # 最后一次失败直接抛出，不再空等
+                time.sleep(0.5 * (i + 1))
     raise last
 
 
@@ -209,12 +224,6 @@ class _JsonFetcher(object):
             pass
 
     # ---- 请求 ----
-    def _urls(self, path):
-        if not self.hosts:
-            return [path]
-        order = ([self.good] if self.good else []) + [h for h in self.hosts if h != self.good]
-        return ['https://%s%s' % (h, path) for h in order]
-
     def json(self, path, key=None, referer=None, timeout=None, tries=None, budget=None):
         cached = self._load(key)
         if cached is not None:
@@ -223,16 +232,17 @@ class _JsonFetcher(object):
             raise Exception('离线模式下缺少缓存: %s' % (key or path[:60]))
         timeout = timeout or self.timeout
         tries = tries or self.retries
-        errbox = [None]
-        deadline = time.time() + (budget or self.budget)
+        budget = budget or self.budget
+        deadline = time.time() + budget
+        state = {'err': None, 'timeout': False}
 
         def attempt(hosts):
+            """依次尝试 hosts，每个主机最多 tries 次。成功返回 JSON，全失败返回 None。"""
             for h in hosts:
                 url = ('https://%s%s' % (h, path)) if self.hosts else path
                 for i in range(tries):
                     if time.time() > deadline:
-                        errbox[0] = errbox[0] or Exception(
-                            '超出单次请求时间预算 %ds' % (budget or self.budget))
+                        state['timeout'] = True
                         return None
                     time.sleep(self.pace)
                     try:
@@ -243,26 +253,26 @@ class _JsonFetcher(object):
                                 self.good = h
                             self._save(key, j)
                             return j
-                        errbox[0] = Exception('空响应: %s' % url[:70])
+                        state['err'] = Exception('空响应: %s' % url[:70])
                     except Exception as e:
-                        errbox[0] = e
-                        time.sleep(0.8 * (i + 1))
+                        state['err'] = e
+                        if i < tries - 1:
+                            time.sleep(0.8 * (i + 1))
             return None
 
-        if not self.hosts:
-            r = attempt([None])
-        else:
-            r = None
-            if self.good:                       # 先用上次成功的主机，通常一次命中
-                r = attempt([self.good])
-                if r is None:
-                    self.good = None            # 该主机失效，回到全量探测
+        r = None
+        if self.hosts and self.good:            # 先用上次成功的主机，通常一次命中
+            r = attempt([self.good])
             if r is None:
-                r = attempt(list(self.hosts))
+                self.good = None                # 该主机失效，回到全量探测
+        if r is None:
+            r = attempt(list(self.hosts) if self.hosts else [None])
         if r is not None:
             return r
-        if errbox[0]:
-            raise errbox[0]
+        if state['timeout']:
+            raise Exception('超出单次请求时间预算 %ds' % budget)
+        if state['err']:
+            raise state['err']
         raise Exception('请求失败: %s' % path[:80])
 
 
@@ -304,14 +314,14 @@ def parallel_map(fn, items, workers=6):
     if not items:
         return results
     lock = threading.Lock()
-    todo = list(range(len(items)))
+    todo = collections.deque(range(len(items)))
 
     def worker():
         while True:
             with lock:
                 if not todo:
                     return
-                i = todo.pop(0)
+                i = todo.popleft()
             try:
                 results[i] = fn(items[i])
             except Exception:
@@ -324,6 +334,30 @@ def parallel_map(fn, items, workers=6):
     for t in ts:
         t.join()
     return results
+
+
+def fetch_all_sources(jobs, workers=6):
+    """并发执行一批互不依赖的取数任务，结果按名字返回。
+
+    jobs: [(名字, 无参可调用), ...]
+    返回 {名字: 结果}；单项失败记为 None 并 warn（含任务名与异常）。
+    """
+    def run(job):
+        _name, fn = job
+        try:
+            return fn(), None
+        except Exception as e:
+            return None, e
+
+    results = parallel_map(run, jobs, workers)
+    out = {}
+    for (name, _fn), res in zip(jobs, results):
+        # parallel_map 把 worker 内的意外异常记为 None；这里统一还原成错误
+        value, err = res if res is not None else (None, Exception('未知异常'))
+        if err is not None:
+            warn('%s 抓取失败: %r' % (name, err))
+        out[name] = value
+    return out
 
 
 def fnum(v, default=0.0):
@@ -342,7 +376,8 @@ def sina_text(key, codes, timeout=25):
     p = os.path.join(HTTP.cache_dir, key) if HTTP.cache_dir else None
     if p and os.path.isfile(p) and not HTTP.refresh:
         try:
-            return codecs.open(p, 'r', 'utf-8').read()
+            with codecs.open(p, 'r', 'utf-8') as fp:
+                return fp.read()
         except Exception:
             pass
     if OFFLINE[0]:
@@ -354,21 +389,21 @@ def sina_text(key, codes, timeout=25):
             d = os.path.dirname(p)
             if d and not os.path.isdir(d):
                 os.makedirs(d)
-            codecs.open(p, 'w', 'utf-8').write(txt)
+            with codecs.open(p, 'w', 'utf-8') as fp:
+                fp.write(txt)
         except Exception:
             pass
     return txt
 
 
+# 预编译：新浪行情文本 hq_str_xxx="..."
+_SINA_HQ_RE = re.compile(r'hq_str_([^=]+)="([^"]*)"')
+
+
 def parse_sina_lines(txt):
     """解析新浪 hq_str_xxx="..." 文本为 {code: [字段列表]}。"""
     out = {}
-    for line in txt.split(';'):
-        line = line.strip()
-        if 'hq_str_' not in line or '="' not in line:
-            continue
-        code = line.split('hq_str_')[1].split('=')[0]
-        body = line.split('="', 1)[1].rsplit('"', 1)[0]
+    for code, body in _SINA_HQ_RE.findall(txt):
         out[code] = body.split(',')
     return out
 
@@ -376,12 +411,13 @@ def parse_sina_lines(txt):
 def fetch_indices(raw_text=None):
     """新浪行情一次取回全部指数。返回 ({code: {...}}, 原始文本)。"""
     codes = ','.join([c for c, _, _ in INDICES])
+    codes_set = set(codes.split(','))
     if raw_text is None:
         raw_text = sina_text('sina_indices.txt', codes)
     parsed = parse_sina_lines(raw_text)
     out = {}
     for code, f in parsed.items():
-        if code not in codes.split(',') or len(f) < 10:
+        if code not in codes_set or len(f) < 10:
             continue
         prev = fnum(f[2])
         price = fnum(f[3])
@@ -446,11 +482,10 @@ def fetch_commodity_fx():
 
 def fetch_breadth(max_pages=70, page_size=100, workers=8):
     """全A股逐页抓取（东财单页上限100）。并发 + 逐页落盘缓存，失败页可下次续跑。"""
-    FS = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048'
 
     def page_path(pn):
         return ('/api/qt/clist/get?pn=%d&pz=%d&po=1&np=1&fltt=2&invt=2&fid=f3'
-                '&fs=%s&fields=f2,f3,f6,f12,f14&ut=%s' % (pn, page_size, FS, EM_UT))
+                '&fs=%s&fields=f2,f3,f6,f12,f14&ut=%s' % (pn, page_size, FS_ALL_A, EM_UT))
 
     def get_page(pn):
         j = EM.json(page_path(pn), key='breadth_p%03d' % pn, timeout=25, budget=90)
@@ -475,44 +510,32 @@ def fetch_breadth(max_pages=70, page_size=100, workers=8):
     need = int(math.ceil((total or len(first)) / float(page_size)))
     need = max(1, min(need, max_pages))
     results = {1: first}
-    pending = list(range(2, need + 1))
-    lock = threading.Lock()
 
-    def run_pass(queue, nworkers):
-        """跑一轮抓取；返回本轮仍失败的页码。"""
+    def run_pass(pages, nworkers):
+        """并发跑一轮抓取；返回本轮仍失败的页码（复用 parallel_map，不重复造线程池）。"""
+        pages = list(pages)
+        if not pages:
+            return []
+
+        def grab(pn):
+            return get_page(pn)[0]
+
+        got = parallel_map(grab, pages, nworkers)
         bad = []
-
-        def worker():
-            while True:
-                with lock:
-                    if not queue:
-                        return
-                    pn = queue.pop(0)
-                try:
-                    rows, _ = get_page(pn)
-                    with lock:
-                        results[pn] = rows
-                except Exception:
-                    with lock:
-                        bad.append(pn)
-
-        nw = max(1, min(nworkers, len(queue))) if queue else 0
-        if not nw:
-            return bad
-        ts = [threading.Thread(target=worker) for _ in range(nw)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join()
+        for pn, rows in zip(pages, got):
+            if rows is None:
+                bad.append(pn)          # 单项异常被 parallel_map 记为 None
+            else:
+                results[pn] = rows
         return bad
 
-    failed = run_pass(pending, workers)
+    failed = run_pass(list(range(2, need + 1)), workers)
 
     # 第二轮补抓：降低并发、放慢节奏，专治瞬时抖动（代理/限流）
     if failed:
         log('  首轮有 %d 页失败，开始第二轮补抓 ...' % len(failed))
         time.sleep(2)
-        failed = run_pass(list(failed), max(1, min(3, workers // 2)))
+        failed = run_pass(failed, max(1, min(3, workers // 2)))
 
     if failed:
         warn('市场宽度有 %d/%d 页最终失败（页码 %s）；再跑一次即可只补这些页'
@@ -524,7 +547,7 @@ def fetch_breadth(max_pages=70, page_size=100, workers=8):
     rows, suspended = [], 0
     for d in out:
         pct = d.get('f3')
-        if not isinstance(pct, (int, float)):   # 停牌 / 无报价，f3 为 '-'
+        if not isinstance(pct, NUM_TYPES):   # 停牌 / 无报价，f3 为 '-'
             suspended += 1
             continue
         rows.append({
@@ -597,20 +620,30 @@ def fetch_market_flow():
 
 def fetch_pools(trade_date):
     """涨停/跌停/炸板家数。trade_date: 'YYYYMMDD'"""
-    res = {}
     conf = [('zt', 'getTopicZTPool', 'fbt:asc'),
             ('dt', 'getTopicDTPool', 'fund:asc'),
             ('zb', 'getTopicZBPool', 'fbt:asc')]
-    for key, api, sort in conf:
+
+    def get_pool(item):
+        key, api, sort = item
         url = ('https://push2ex.eastmoney.com/%s?ut=7eea3edcaed734bea9cbfc24409ed989'
                '&dpt=wz.ztzt&Pageindex=0&pagesize=1&sort=%s&date=%s' % (api, sort, trade_date))
         try:
             j = HTTP.json(url, key='pool_%s_%s' % (key, trade_date),
                           referer='https://quote.eastmoney.com/')
-            res[key] = (j.get('data') or {}).get('tc')
+            return (j.get('data') or {}).get('tc'), None
         except Exception as e:
-            res[key] = None
-            warn('%s 池抓取失败: %s' % (key, e))
+            return None, e
+
+    # 三个池互不依赖，并发抓取
+    vals = parallel_map(get_pool, conf, workers=len(conf))
+    res = {}
+    for (key, _, _), (tc, err) in zip(conf, vals):
+        res[key] = tc
+        if err is not None:
+            warn('%s 池抓取失败: %s' % (key, err))
+        elif tc is None:
+            warn('%s 池抓取失败（接口未返回 tc 字段）' % key)
     return res
 
 
@@ -656,22 +689,27 @@ def fetch_turnover_history(secid, lmt=10):
 
 
 def fetch_news(max_pages=3, page_size=100):
-    """东财 7x24 快讯。"""
-    out = []
-    for pi in range(1, max_pages + 1):
+    """东财 7x24 快讯（各页并发抓取，单页失败只丢该页，不再整段放弃）。"""
+    def get_page(pi):
         url = ('https://np-listapi.eastmoney.com/comm/web/getFastNewsList?client=web'
                '&biz=web_724&fastColumn=102&sortEnd=&pageSize=%d&req_trace=1&page_index=%d'
                % (page_size, pi))
         try:
             j = HTTP.json(url, key='news_p%d' % pi, tries=3,
                           referer='https://kuaixun.eastmoney.com/')
+            return (((j or {}).get('data') or {}).get('fastNewsList') or []), None
         except Exception as e:
-            warn('新闻第%d页失败: %s' % (pi, e))
-            break
-        lst = ((j or {}).get('data') or {}).get('fastNewsList') or []
-        if not lst:
-            break
+            return [], e
+
+    pages = list(range(1, max_pages + 1))
+    results = parallel_map(get_page, pages, workers=max(1, min(len(pages), 4)))
+    out = []
+    for pi, (lst, err) in zip(pages, results):
+        if err is not None:
+            warn('新闻第%d页失败: %s' % (pi, err))
+            continue
         out.extend(lst)
+
     seen, rows = set(), []
     for it in out:
         t = (it.get('title') or '').strip()
@@ -691,28 +729,70 @@ def analyze(breadth, indices, market_flow, margin, pools, kl):
     a = {}
     n = len(breadth)
     a['n'] = n
-    a['up'] = sum(1 for x in breadth if x['pct'] > 0)
-    a['down'] = sum(1 for x in breadth if x['pct'] < 0)
-    a['flat'] = n - a['up'] - a['down']
-    a['limit_up'] = sum(1 for x in breadth if x['pct'] >= 9.8)
-    a['limit_dn'] = sum(1 for x in breadth if x['pct'] <= -9.8)
-    a['big_up'] = sum(1 for x in breadth if x['pct'] >= 5)
-    a['big_dn'] = sum(1 for x in breadth if x['pct'] <= -5)
-    pcts = sorted(x['pct'] for x in breadth)
+
+    # 一次遍历完成涨跌家数、分布等统计，避免对 5000+ 只股票多次扫描
+    up = down = flat = 0
+    limit_up = limit_dn = big_up = big_dn = 0
+    pcts = []
+    # 分布桶顺序与展示一致
+    dist_counts = [0] * 10
+    for x in breadth:
+        p = x['pct']
+        pcts.append(p)
+        if p > 0:
+            up += 1
+        elif p < 0:
+            down += 1
+        else:
+            flat += 1
+        if p >= 9.8:
+            limit_up += 1
+        if p <= -9.8:
+            limit_dn += 1
+        if p >= 5:
+            big_up += 1
+        if p <= -5:
+            big_dn += 1
+        # 按区间累加
+        if p >= 9.8:
+            dist_counts[0] += 1
+        elif p >= 7:
+            dist_counts[1] += 1
+        elif p >= 5:
+            dist_counts[2] += 1
+        elif p >= 2:
+            dist_counts[3] += 1
+        elif p >= 0:
+            dist_counts[4] += 1
+        elif p >= -2:
+            dist_counts[5] += 1
+        elif p >= -5:
+            dist_counts[6] += 1
+        elif p >= -7:
+            dist_counts[7] += 1
+        elif p > -9.8:
+            dist_counts[8] += 1
+        else:
+            dist_counts[9] += 1
+
+    bucket_names = ['>=9.8%', '7~9.8%', '5~7%', '2~5%', '0~2%',
+                    '-2~0%', '-5~-2%', '-7~-5%', '-9.8~-7%', '<=-9.8%']
+
+    a['up'] = up
+    a['down'] = down
+    a['flat'] = flat
+    a['limit_up'] = limit_up
+    a['limit_dn'] = limit_dn
+    a['big_up'] = big_up
+    a['big_dn'] = big_dn
+    pcts.sort()
     a['median'] = pcts[n // 2] if n else 0
     a['mean'] = (sum(pcts) / float(n)) if n else 0
-    a['amount_all'] = sum(x['amount'] for x in breadth)
-    a['top_gainers'] = sorted(breadth, key=lambda x: -x['pct'])[:15]
-    a['top_losers'] = sorted(breadth, key=lambda x: x['pct'])[:15]
-    a['top_turnover'] = sorted(breadth, key=lambda x: -x['amount'])[:20]
-
-    # 涨跌幅分布
-    buckets = [('>=9.8%', lambda v: v >= 9.8), ('7~9.8%', lambda v: 7 <= v < 9.8),
-               ('5~7%', lambda v: 5 <= v < 7), ('2~5%', lambda v: 2 <= v < 5),
-               ('0~2%', lambda v: 0 <= v < 2), ('-2~0%', lambda v: -2 <= v < 0),
-               ('-5~-2%', lambda v: -5 <= v < -2), ('-7~-5%', lambda v: -7 <= v < -5),
-               ('-9.8~-7%', lambda v: -9.8 < v < -7), ('<=-9.8%', lambda v: v <= -9.8)]
-    a['dist'] = [(nm, sum(1 for x in breadth if fn(x['pct']))) for nm, fn in buckets]
+    # 用堆取 TOP-N，避免对全量股票做完整排序
+    a['top_gainers'] = heapq.nlargest(15, breadth, key=lambda x: x['pct'])
+    a['top_losers'] = heapq.nsmallest(15, breadth, key=lambda x: x['pct'])
+    a['top_turnover'] = heapq.nlargest(20, breadth, key=lambda x: x['amount'])
+    a['dist'] = list(zip(bucket_names, dist_counts))   # py3 下 zip 是迭代器，这里固化成列表
 
     # 两市成交额（沪+深）
     sh = indices.get('sh000001') or {}
@@ -889,7 +969,7 @@ def yi(v):
     return '%.1f亿' % (v / 1e8) if abs(v) >= 1e8 else '%.0f万' % (v / 1e4)
 
 
-def render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date, args,
+def render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date,
            signals=None):
     L = []
     add = L.append
@@ -1011,27 +1091,18 @@ def render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date, a
     # ---------------- 五、个股
     add('## 五、个股榜单')
     add('')
-    add('**涨幅榜 TOP15**')
-    add('')
-    add('| 代码 | 名称 | 涨跌幅 | 成交额 |')
-    add('|---|---|---|---|')
-    for x in a['top_gainers']:
-        add('| %s | %s | %+.2f%% | %.2f亿 |' % (x['code'], x['name'], x['pct'], x['amount'] / 1e8))
-    add('')
-    add('**跌幅榜 TOP15**')
-    add('')
-    add('| 代码 | 名称 | 涨跌幅 | 成交额 |')
-    add('|---|---|---|---|')
-    for x in a['top_losers']:
-        add('| %s | %s | %+.2f%% | %.2f亿 |' % (x['code'], x['name'], x['pct'], x['amount'] / 1e8))
-    add('')
-    add('**成交额榜 TOP20**')
-    add('')
-    add('| 代码 | 名称 | 涨跌幅 | 成交额 |')
-    add('|---|---|---|---|')
-    for x in a['top_turnover']:
-        add('| %s | %s | %+.2f%% | %.2f亿 |' % (x['code'], x['name'], x['pct'], x['amount'] / 1e8))
-    add('')
+    stock_tables = [('涨幅榜 TOP15', a['top_gainers']),
+                    ('跌幅榜 TOP15', a['top_losers']),
+                    ('成交额榜 TOP20', a['top_turnover'])]
+    for title, rows in stock_tables:
+        add('**%s**' % title)
+        add('')
+        add('| 代码 | 名称 | 涨跌幅 | 成交额 |')
+        add('|---|---|---|---|')
+        for x in rows:
+            add('| %s | %s | %+.2f%% | %.2f亿 |'
+                % (x['code'], x['name'], x['pct'], x['amount'] / 1e8))
+        add('')
 
     # ---------------- 六、消息面
     if news:
@@ -1237,7 +1308,8 @@ def main():
         log('缓存目录 = %s%s' % (cachedir, '（--refresh：忽略缓存）' if args.refresh else ''))
         if not intraday:
             try:                   # 保存指数原始文本，供日后离线复盘
-                codecs.open(os.path.join(cachedir, 'sina_indices.txt'), 'w', 'utf-8').write(sina_raw)
+                with codecs.open(os.path.join(cachedir, 'sina_indices.txt'), 'w', 'utf-8') as fp:
+                    fp.write(sina_raw)
             except Exception:
                 pass
 
@@ -1286,22 +1358,20 @@ def main():
         else:
             warn('板块资金(%s)抓取失败' % key)
 
-    # 5) 主力资金 / 两融 / 涨跌停池
-    try:
-        market_flow = fetch_market_flow()
-    except Exception as e:
-        market_flow = None
-        warn('主力资金抓取失败: %r' % (e,))
-    try:
-        margin = fetch_margin()
-    except Exception as e:
-        margin = []
-        warn('两融数据抓取失败: %r' % (e,))
-    try:
-        pools = fetch_pools(trade_compact)
-    except Exception as e:
-        pools = {}
-        warn('涨跌停池抓取失败: %r' % (e,))
+    # 5) 主力资金 / 两融 / 涨跌停池 / 外围 / 商品：彼此独立，一次并发抓完
+    #    （原先这 5 个源是串行请求，是整条链路上最大的一块可压缩等待时间）
+    src = fetch_all_sources([
+        ('主力资金', fetch_market_flow),
+        ('两融数据', fetch_margin),
+        ('涨跌停池', lambda: fetch_pools(trade_compact)),
+        ('外围市场', fetch_global),
+        ('商品/汇率', fetch_commodity_fx),
+    ], args.workers)
+    market_flow = src.get('主力资金')
+    margin = src.get('两融数据') or []
+    pools = src.get('涨跌停池') or {}
+    glob = src.get('外围市场') or []
+    comm = src.get('商品/汇率') or {}
 
     # 6) 均线 + 成交额历史（并发抓取）
     kl, turnover_hist = {}, []
@@ -1317,18 +1387,6 @@ def main():
     except Exception as e:
         warn('成交额历史抓取失败: %r' % (e,))
 
-    # 7) 外围 + 商品
-    try:
-        glob = fetch_global()
-    except Exception as e:
-        glob = []
-        warn('外围市场抓取失败: %r' % (e,))
-    try:
-        comm = fetch_commodity_fx()
-    except Exception as e:
-        comm = {}
-        warn('商品/汇率抓取失败: %r' % (e,))
-
     # 8) 市场宽度（最重，约 60 页，放在最后）
     breadth, total_all, suspended = [], 0, 0
     if not args.no_breadth:
@@ -1341,7 +1399,7 @@ def main():
         except Exception as e:
             warn('市场宽度抓取失败: %r' % (e,))
 
-    # 7) 新闻
+    # 9) 新闻
     news = []
     if not args.no_news:
         log('抓取快讯 ...')
@@ -1351,7 +1409,7 @@ def main():
         except Exception as e:
             warn('新闻抓取失败: %s' % e)
 
-    # 8) 分析 + 渲染
+    # 10) 分析 + 渲染
     log('计算指标并生成报告 ...')
     if not breadth:
         # 无宽度数据时给个空壳，保证报告仍能生成
@@ -1360,7 +1418,7 @@ def main():
     a['total_all'] = total_all
     a['suspended'] = suspended
     sup, pre, lv = build_signals(a, idx, turnover_hist, glob)
-    md = render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date, args,
+    md = render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date,
                 signals=(sup, pre, lv))
 
     outdir = args.dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')

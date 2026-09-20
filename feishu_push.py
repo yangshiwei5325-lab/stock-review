@@ -46,9 +46,11 @@ PY3 = sys.version_info[0] >= 3
 if PY3:
     from urllib.request import Request, urlopen
     from urllib.parse import quote_plus
+    STRING_TYPES = (str,)
 else:
     from urllib2 import Request, urlopen
     from urllib import quote_plus
+    STRING_TYPES = (str, unicode)   # noqa: F821  (py2 下的 unicode)
 
 
 def ensure_utf8_stdout():
@@ -141,8 +143,14 @@ def http_post(url, json_body=None, data=None, headers=None, timeout=20, retries=
     for i in range(retries):
         try:
             resp = urlopen(Request(url, data=body, headers=hdrs), timeout=timeout)
-            return (getattr(resp, 'status', None) or resp.getcode(),
-                    resp.read().decode('utf-8', 'ignore'))
+            try:
+                status = getattr(resp, 'status', None) or resp.getcode()
+                return status, resp.read().decode('utf-8', 'ignore')
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
         except Exception as e:
             txt = None
             try:                       # HTTP 4xx/5xx 也带响应体，尽量读出来
@@ -152,7 +160,8 @@ def http_post(url, json_body=None, data=None, headers=None, timeout=20, retries=
             if txt:
                 return getattr(e, 'code', 0), txt
             last = e
-            time.sleep(1.0 * (i + 1))
+            if i < retries - 1:        # 最后一次失败不再空等，直接抛出
+                time.sleep(1.0 * (i + 1))
     raise Exception('network error after %d retries: %s: %s'
                     % (retries, _ascii(type(last).__name__), _ascii('%s' % (last,))))
 
@@ -376,13 +385,19 @@ def render_markdown(sm):
 
 
 # ================================================================ 发送
-def send_feishu_webhook(webhook, card, secret='', timeout=20):
-    """飞书自定义机器人。返回 (ok, 说明)。"""
-    body = {'msg_type': 'interactive', 'card': card}
+def _add_timestamp_and_sign(body, secret=''):
+    """添加时间戳和签名（如果提供密钥）。"""
     if secret:
         ts = str(int(time.time()))
         body['timestamp'] = ts
         body['sign'] = gen_sign(ts, secret)
+    return body
+
+
+def send_feishu_webhook(webhook, card, secret='', timeout=20):
+    """飞书自定义机器人。返回 (ok, 说明)。"""
+    body = {'msg_type': 'interactive', 'card': card}
+    body = _add_timestamp_and_sign(body, secret)
     status, txt = http_post(webhook, json_body=body, timeout=timeout)
     return _parse_feishu(txt, status)
 
@@ -390,12 +405,18 @@ def send_feishu_webhook(webhook, card, secret='', timeout=20):
 def send_feishu_text(webhook, text, secret='', timeout=20):
     """降级用：纯文本消息。"""
     body = {'msg_type': 'text', 'content': {'text': text}}
-    if secret:
-        ts = str(int(time.time()))
-        body['timestamp'] = ts
-        body['sign'] = gen_sign(ts, secret)
+    body = _add_timestamp_and_sign(body, secret)
     status, txt = http_post(webhook, json_body=body, timeout=timeout)
     return _parse_feishu(txt, status)
+
+
+# 飞书错误码 -> 人话（便于按需扩充）
+FEISHU_ERRORS = {
+    19001: 'webhook token 无效，请检查 push_config.json 里的 feishu.webhook',
+    19021: '签名校验失败：请检查 feishu.secret 是否与机器人设置一致',
+    9499: '消息发送过于频繁，请降低推送频率',
+    19024: '机器人被移出群聊或未在群内',
+}
 
 
 def _parse_feishu(txt, status):
@@ -406,14 +427,8 @@ def _parse_feishu(txt, status):
     code = j.get('code')
     if code == 0:
         return True, 'ok'
-    if code == 19001:
-        return False, 'webhook token 无效，请检查 push_config.json 里的 feishu.webhook'
-    if code == 19021:
-        return False, '签名校验失败：请检查 feishu.secret 是否与机器人设置一致'
-    if code == 9499:
-        return False, '消息发送过于频繁，请降低推送频率'
-    if code == 19024:
-        return False, '机器人被移出群聊或未在群内'
+    if code in FEISHU_ERRORS:
+        return False, FEISHU_ERRORS[code]
     return False, 'code=%s msg=%s' % (code, j.get('msg'))
 
 
@@ -448,20 +463,33 @@ def send_feishu_app(app_id, app_secret, receive_id, card, receive_id_type='open_
     return False, 'code=%s msg=%s' % (j.get('code'), j.get('msg'))
 
 
-def send_custom(sec, title, content, card, timeout=20):
-    """通用 webhook：body 里支持 {{title}} / {{content}} 占位符。"""
+def _replace_placeholders(data, title, content):
+    """递归替换 {{title}} / {{content}} 占位符。
+
+    注意：返回**新的**容器，绝不原地修改入参。配置里的 body 模板会被反复使用，
+    一旦原地改写，第二次推送就会把上一次的标题/正文当成模板再发一遍。
+    """
+    if isinstance(data, dict):
+        return dict((k, _replace_placeholders(v, title, content))
+                    for k, v in data.items())
+    if isinstance(data, (list, tuple)):
+        return [_replace_placeholders(v, title, content) for v in data]
+    if isinstance(data, STRING_TYPES):
+        return data.replace('{{title}}', title).replace('{{content}}', content)
+    return data
+
+
+def send_custom(sec, title, content, timeout=20):
+    """通用 webhook：body 里支持 {{title}} / {{content}} 占位符。
+
+    占位符通过结构化递归替换，交给 json 序列化去处理转义，
+    不再手工拼接 JSON 字符串（原先对引号/换行的手工转义很容易出错）。
+    """
     url = sec.get('url')
     headers = sec.get('headers') or {}
     tmpl = sec.get('body')
     if isinstance(tmpl, dict):
-        raw = json.dumps(tmpl, ensure_ascii=False)
-        raw = raw.replace('{{title}}', title)
-        raw = raw.replace('{{content}}', content.replace('\\', '\\\\').replace('"', '\\"')
-                          .replace('\n', '\\n'))
-        try:
-            body = json.loads(raw)
-        except Exception:
-            body = {'title': title, 'content': content}
+        body = _replace_placeholders(tmpl, title, content)
         status, txt = http_post(url, json_body=body, headers=headers, timeout=timeout)
     else:
         status, txt = http_post(url, data={'title': title, 'content': content},
@@ -497,6 +525,13 @@ def _state_read():
 
 def _state_write(st):
     try:
+        d = os.path.dirname(STATE_FILE)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with codecs.open(STATE_FILE, 'w', 'utf-8') as fp:
+            fp.write(json.dumps(st, ensure_ascii=False))
+    except Exception:
+        pass
         d = os.path.dirname(STATE_FILE)
         if d and not os.path.isdir(d):
             os.makedirs(d)
@@ -557,15 +592,13 @@ def push(summary, cfg=None, provider=None, dry_run=False, force=False, timeout=2
 
     if provider == 'feishu':
         ok, msg = send_feishu_webhook(sec['webhook'], card, sec.get('secret', ''), timeout)
-        if not ok and ('无效' in (msg or '') or '19001' in (msg or '')):
-            pass
     elif provider == 'feishu_app':
         ok, msg = send_feishu_app(sec['app_id'], sec['app_secret'],
                                   sec.get('receive_id', ''),
                                   card, sec.get('receive_id_type', 'open_id'), timeout,
                                   sec.get('api_base') or 'https://open.feishu.cn')
     else:
-        ok, msg = send_custom(sec, title, render_markdown(summary), card, timeout)
+        ok, msg = send_custom(sec, title, render_markdown(summary), timeout)
 
     if ok:
         print('[OK] 已推送到 %s：%s' % (provider, msg))
