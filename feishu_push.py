@@ -52,13 +52,24 @@ else:
 
 
 def ensure_utf8_stdout():
-    """Python 2 下让 print 支持中文；已包装过就跳过（避免重复包装）。"""
+    """Python 2 下让 print 支持中文（幂等，重复调用不会二次包装）。
+
+    注意：不能用 .encoding 判断是否已包装。codecs.StreamWriter 通过 __getattr__
+    把未定义的属性代理给内层流，读到的仍是原始流的 encoding（重定向时常常是
+    None），于是会被反复包装；二次包装后写中文会在内层 encode 时按 ascii 解码，
+    抛 UnicodeDecodeError。这里改用自定义标记做幂等判断。
+    """
     if PY3:
         return
     try:
-        if 'utf' in (getattr(sys.stdout, 'encoding', '') or '').lower():
+        so = sys.stdout
+        if getattr(so, '_utf8_wrapped', False):
             return
-        sys.stdout = codecs.getwriter('utf-8')(sys.stdout)
+        if 'utf' in (getattr(so, 'encoding', '') or '').lower():
+            return
+        w = codecs.getwriter('utf-8')(so)
+        w._utf8_wrapped = True
+        sys.stdout = w
     except Exception:
         pass
 

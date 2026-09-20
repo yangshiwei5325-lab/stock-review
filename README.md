@@ -195,14 +195,31 @@ python stock_review.py --push --no-live  # 即使盘中也不吃缓存（想快�
 
 ### 每个交易日自动跑（Windows 计划任务）
 
-1. 任务计划程序 → 创建基本任务 → 触发器：每天 **15:35**（收盘后）
-2. 操作 → 启动程序 → 程序填 `一键复盘并推送.bat` 的完整路径
-3. 「起始于」填 `F:\DeepSeek\stock-review`
+**一键注册**（推荐；本机已注册为任务「A股每日复盘推送」）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File setup_task.ps1
+```
+
+每周一~周五 **15:30** 自动运行 `每日复盘推送.bat`（生成报告 + 推送飞书），
+输出追加到 `logs\daily_push.log`。卸载或改时间：
+
+```powershell
+Unregister-ScheduledTask -TaskName 'A股每日复盘推送' -Confirm:$false
+Get-ScheduledTask  -TaskName 'A股每日复盘推送' | Get-ScheduledTaskInfo   # 看上次/下次运行
+```
+
+手工创建的话：任务计划程序 → 创建基本任务 → 触发器：每周一~周五 **15:30**
+（收盘后）→ 操作 → 启动程序 → 程序填 `每日复盘推送.bat` 的完整路径，
+「起始于」填 `F:\DeepSeek\stock-review`，并勾选「不管用户是否登录都要运行」。
+
+> 因为 `push_config.json` 里 `once_per_day = true`，节假日即使触发也只会拿到
+> 最近一个交易日的数据、且与已推送记录同日，会自动跳过，不会重复轰炸。
 
 Linux/macOS 用 crontab：
 
 ```cron
-35 15 * * 1-5 cd /path/to/stock-review && ./run.sh --push >> push.log 2>&1
+30 15 * * 1-5 cd /path/to/stock-review && ./run.sh --push >> logs/daily_push.log 2>&1
 ```
 
 ### 单独使用推送工具

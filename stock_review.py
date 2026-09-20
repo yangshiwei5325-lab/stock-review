@@ -43,9 +43,17 @@ if PY3:
 else:
     from urllib2 import Request, urlopen
     try:
-        # 已经包装过（例如先导入了 feishu_push）就不再重复包装，否则中文会编码报错
-        if 'utf' not in (getattr(sys.stdout, 'encoding', '') or '').lower():
-            sys.stdout = codecs.getwriter('utf-8')(sys.stdout)
+        # 让 print 支持中文。这里必须用自定义标记做幂等，不能靠 .encoding：
+        # codecs.StreamWriter 会把未知属性代理给内层流，读到的永远是原始流的
+        # encoding（重定向时常为 None），判断必然失败并被重复包装；二次包装后
+        # 输出中文会在内层 encode 时按 ascii 解码，抛 UnicodeDecodeError。
+        # 与 feishu_push.ensure_utf8_stdout() 共用 '_utf8_wrapped' 标记。
+        _so = sys.stdout
+        if not getattr(_so, '_utf8_wrapped', False) and \
+                'utf' not in (getattr(_so, 'encoding', '') or '').lower():
+            _so = codecs.getwriter('utf-8')(_so)
+            _so._utf8_wrapped = True
+            sys.stdout = _so
     except Exception:
         pass
 

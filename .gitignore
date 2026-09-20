@@ -4,6 +4,7 @@ push_config.json
 # ---- 生成物 ----
 reports/
 .cache/
+logs/
 
 # ---- Python ----
 __pycache__/
