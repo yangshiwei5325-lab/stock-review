@@ -19,6 +19,8 @@ A股每日复盘一键脚本  (stock_review.py)
 缓存策略：
     交易时段（周一~周五 09:10-15:05）自动绕过缓存抓实时数据，且盘中快照不写回缓存；
     收盘后走缓存，秒级完成且与收盘结果一致。
+    板块、宽度、资金、均线、新闻同时抓。飞书在关键数据齐了就发，不等新闻和商品。
+    行情主机记住上次可用的那台；单次请求超时缩短，避免一台坏主机把整次推送拖住。
 
 兼容 Python 2.7 与 Python 3.x。
 数据来源：东方财富 / 新浪财经 公开行情接口。
@@ -29,6 +31,7 @@ from __future__ import print_function, unicode_literals, division
 import os
 import sys
 import json
+import gzip
 import math
 import time
 import codecs
@@ -39,6 +42,7 @@ import threading
 import collections
 import heapq
 import re
+from io import BytesIO
 
 # ---------------------------------------------------------------- py2/py3 兼容
 PY3 = sys.version_info[0] >= 3
@@ -142,9 +146,29 @@ def warn(msg):
 
 
 # ================================================================ HTTP 基础
-def http_get(url, referer=None, timeout=25, retries=4, encoding='utf-8'):
-    """带重试的 GET，返回解码后的文本（最后一次失败后不再无谓等待）。"""
-    headers = {'User-Agent': UA, 'Accept': '*/*'}
+def _resp_header(resp, name):
+    try:
+        info = resp.info()
+    except Exception:
+        return ''
+    if not info:
+        return ''
+    try:
+        val = info.get(name)
+        if not val:
+            val = info.get(name.lower())
+        return val or ''
+    except Exception:
+        return ''
+
+
+def http_get(url, referer=None, timeout=12, retries=2, encoding='utf-8'):
+    """带重试的 GET，返回解码后的文本（最后一次失败后不再无谓等待）。
+
+    声明 gzip：全市场分页的 JSON 体积能小一截，慢网络上更明显。
+    解压失败就当这次请求失败，交给外层换主机或重试，不把乱码当数据。
+    """
+    headers = {'User-Agent': UA, 'Accept': '*/*', 'Accept-Encoding': 'gzip'}
     if referer:
         headers['Referer'] = referer
     last = None
@@ -153,6 +177,8 @@ def http_get(url, referer=None, timeout=25, retries=4, encoding='utf-8'):
             resp = urlopen(Request(url, headers=headers), timeout=timeout)
             try:
                 raw = resp.read()
+                if 'gzip' in _resp_header(resp, 'Content-Encoding').lower():
+                    raw = gzip.GzipFile(fileobj=BytesIO(raw)).read()
             finally:
                 try:
                     resp.close()
@@ -162,7 +188,7 @@ def http_get(url, referer=None, timeout=25, retries=4, encoding='utf-8'):
         except Exception as e:
             last = e
             if i < retries - 1:          # 最后一次失败直接抛出，不再空等
-                time.sleep(0.5 * (i + 1))
+                time.sleep(0.3 * (i + 1))
     raise last
 
 
@@ -178,7 +204,7 @@ class _JsonFetcher(object):
     """
 
     def __init__(self, hosts=None, cache_dir=None, referer='https://quote.eastmoney.com/',
-                 timeout=20, retries=4, pace=0.15, budget=45):
+                 timeout=8, retries=2, pace=0.02, budget=20, slots=8):
         self.hosts = list(hosts or [])
         self.good = None
         self.cache_dir = cache_dir
@@ -189,6 +215,9 @@ class _JsonFetcher(object):
         self.budget = budget        # 单次 json() 的总时间预算（秒），超出即放弃
         self.refresh = False
         self.no_write = False       # True = 只抓不写缓存（盘中实时模式）
+        self.host_file = None       # 记住上次可用的行情主机，下次不必从坏主机开始
+        self._host_lock = threading.Lock()
+        self._net = threading.Semaphore(max(1, int(slots)))
 
     # ---- 缓存 ----
     def _path(self, key):
@@ -223,6 +252,46 @@ class _JsonFetcher(object):
         except Exception:
             pass
 
+    # ---- 主机记忆 ----
+    def set_slots(self, n):
+        """限制同时打到同一组主机的请求数，避免并行阶段把代理打满。"""
+        self._net = threading.Semaphore(max(1, int(n)))
+
+    def _ordered_hosts(self):
+        if not self.hosts:
+            return [None]
+        good = self.good
+        if good and good in self.hosts:
+            return [good] + [h for h in self.hosts if h != good]
+        return list(self.hosts)
+
+    def _remember(self, host):
+        if not host:
+            return
+        with self._host_lock:
+            if host == self.good:
+                return
+            self.good = host
+            path = self.host_file
+        if not path:
+            return
+        try:
+            folder = os.path.dirname(path)
+            if folder and not os.path.isdir(folder):
+                os.makedirs(folder)
+            with codecs.open(path, 'w', 'utf-8') as fp:
+                fp.write(host)
+        except Exception:
+            pass
+
+    def _forget(self, host):
+        """只有第一家发现这台主机挂了的线程返回 True，避免日志刷屏。"""
+        with self._host_lock:
+            if host and self.good == host:
+                self.good = None
+                return True
+        return False
+
     # ---- 请求 ----
     def json(self, path, key=None, referer=None, timeout=None, tries=None, budget=None):
         cached = self._load(key)
@@ -231,65 +300,135 @@ class _JsonFetcher(object):
         if OFFLINE[0]:
             raise Exception('离线模式下缺少缓存: %s' % (key or path[:60]))
         timeout = timeout or self.timeout
-        tries = tries or self.retries
+        tries = self.retries if tries is None else tries
         budget = budget or self.budget
+        self._net.acquire()
+        try:
+            return self._fetch(path, key, referer, timeout, tries, budget)
+        finally:
+            self._net.release()
+
+    def _fetch(self, path, key, referer, timeout, tries, budget):
+        """多主机：每台只试一次，坏了立刻换下一台。单主机或完整 URL：按 tries 重试。
+
+        以前每台主机连试 4 次、中间还空等，一台卡住就能把整页预算耗到 45~90 秒，
+        全市场几十页叠在一起，推送就会突然慢好几分钟。
+        """
         deadline = time.time() + budget
         state = {'err': None, 'timeout': False}
 
-        def attempt(hosts):
-            """依次尝试 hosts，每个主机最多 tries 次。成功返回 JSON，全失败返回 None。"""
-            for h in hosts:
-                url = ('https://%s%s' % (h, path)) if self.hosts else path
-                for i in range(tries):
-                    if time.time() > deadline:
-                        state['timeout'] = True
-                        return None
-                    time.sleep(self.pace)
-                    try:
-                        j = http_json(url, referer=referer or self.referer,
-                                      timeout=timeout, retries=1)
-                        if j is not None:
-                            if self.hosts:
-                                self.good = h
-                            self._save(key, j)
-                            return j
-                        state['err'] = Exception('空响应: %s' % url[:70])
-                    except Exception as e:
-                        state['err'] = e
-                        if i < tries - 1:
-                            time.sleep(0.8 * (i + 1))
-            return None
+        def one(h):
+            if self.pace:
+                time.sleep(self.pace)
+            remain = deadline - time.time()
+            if remain < 1.5:
+                state['timeout'] = True
+                return None
+            url = ('https://%s%s' % (h, path)) if h else path
+            try:
+                j = http_json(url, referer=referer or self.referer,
+                              timeout=min(float(timeout), remain), retries=1)
+            except Exception as e:
+                state['err'] = e
+                return None
+            if j is None:
+                state['err'] = Exception('空响应: %s' % url[:70])
+                return None
+            if h:
+                self._remember(h)
+            self._save(key, j)
+            return j
 
-        r = None
-        if self.hosts and self.good:            # 先用上次成功的主机，通常一次命中
-            r = attempt([self.good])
-            if r is None:
-                self.good = None                # 该主机失效，回到全量探测
-        if r is None:
-            r = attempt(list(self.hosts) if self.hosts else [None])
-        if r is not None:
-            return r
-        if state['timeout']:
-            raise Exception('超出单次请求时间预算 %ds' % budget)
-        if state['err']:
-            raise state['err']
-        raise Exception('请求失败: %s' % path[:80])
+        def fail():
+            if state['timeout']:
+                raise Exception('超出单次请求时间预算 %ds' % budget)
+            if state['err']:
+                raise state['err']
+            raise Exception('请求失败: %s' % path[:80])
+
+        # 日K只有一台主机；涨跌停池/快讯是完整 URL。这两种都没有“换主机”可走。
+        if not self.hosts or len(self.hosts) == 1:
+            h = self.hosts[0] if self.hosts else None
+            n = max(1, tries)
+            for i in range(n):
+                got = one(h)
+                if got is not None:
+                    return got
+                if state['timeout']:
+                    break
+                if i + 1 < n:
+                    time.sleep(0.25 * (i + 1))
+            fail()
+
+        hosts = self._ordered_hosts()
+        preferred = self.good
+        for h in hosts:
+            got = one(h)
+            if got is not None:
+                return got
+            if state['timeout']:
+                break
+            if preferred and h == preferred:
+                if self._forget(preferred):
+                    log('行情主机 %s 无响应，切换其它主机' % preferred)
+                preferred = None
+        fail()
 
 
 # 行情客户端实例（cache_dir / refresh 在 main 里按交易日设置）
-EM = _JsonFetcher(hosts=EM_HOSTS)                                        # 东财行情主机
-EM_HIS = _JsonFetcher(hosts=HIS_HOSTS)                                   # 东财日K主机
-HTTP = _JsonFetcher(hosts=None, referer='https://data.eastmoney.com/')   # 涨跌停池/两融/快讯
+EM = _JsonFetcher(hosts=EM_HOSTS, timeout=8, budget=20, slots=8)          # 东财行情主机
+EM_HIS = _JsonFetcher(hosts=HIS_HOSTS, timeout=8, budget=16, slots=4)     # 东财日K主机
+HTTP = _JsonFetcher(hosts=None, referer='https://data.eastmoney.com/',
+                    timeout=10, retries=2, budget=16, slots=6)             # 涨跌停池/两融/快讯
 
 
-def em_json(path, hosts=None, referer='https://quote.eastmoney.com/', timeout=25, key=None):
+def em_json(path, hosts=None, referer='https://quote.eastmoney.com/', timeout=8, key=None):
     """请求东财接口。hosts=HIS_HOSTS 时走日K主机。"""
     if hosts == HIS_HOSTS:
         return EM_HIS.json(path, key=key, referer=referer, timeout=timeout)
     return EM.json(path, key=key, referer=referer, timeout=timeout)
 
 
-def retry_call(fn, attempts=3, delay=4.0, label=''):
+def load_saved_quote_host(base):
+    """读上次成功的行情主机。文件放在 .cache 根下，不跟某个交易日走。"""
+    path = os.path.join(base, '.cache', 'em_host.txt')
+    EM.host_file = path
+    try:
+        if not os.path.isfile(path):
+            return None
+        with codecs.open(path, 'r', 'utf-8') as fp:
+            host = fp.read().strip()
+        if host in EM_HOSTS:
+            EM.good = host
+            return host
+    except Exception:
+        pass
+    return None
+
+
+def probe_quote_host():
+    """用很短的超时挑一台能用的东财行情主机。全失败也不抛，后面的请求还会再试。"""
+    order = []
+    if EM.good in EM_HOSTS:
+        order.append(EM.good)
+    for h in EM_HOSTS:
+        if h not in order:
+            order.append(h)
+    for h in order:
+        url = ('https://%s/api/qt/clist/get?pn=1&pz=1&po=1&np=1&fltt=2&invt=2'
+               '&fid=f3&fs=m:1+t:2&fields=f3&ut=%s' % (h, EM_UT))
+        try:
+            http_json(url, referer='https://quote.eastmoney.com/', timeout=4, retries=1)
+            EM._remember(h)
+            return h
+        except Exception:
+            if EM.good == h:
+                EM._forget(h)
+    log('行情主机预热未命中（不阻塞，后续按需自动切换）')
+    return None
+
+
+def retry_call(fn, attempts=2, delay=0.8, label=''):
     """对整批操作做几次尝试，用来扛过代理/接口的瞬时不可用。"""
     last = None
     for i in range(attempts):
@@ -383,7 +522,8 @@ def sina_text(key, codes, timeout=25):
     if OFFLINE[0]:
         raise Exception('离线模式下缺少缓存: %s' % key)
     txt = http_get('https://hq.sinajs.cn/list=' + codes,
-                   referer='https://finance.sina.com.cn', encoding='gbk', timeout=timeout)
+                   referer='https://finance.sina.com.cn', encoding='gbk',
+                   timeout=min(timeout, 10), retries=2)
     if p and not HTTP.no_write:      # 盘中快照不落盘
         try:
             d = os.path.dirname(p)
@@ -488,21 +628,21 @@ def fetch_breadth(max_pages=70, page_size=100, workers=8):
                 '&fs=%s&fields=f2,f3,f6,f12,f14&ut=%s' % (pn, page_size, FS_ALL_A, EM_UT))
 
     def get_page(pn):
-        j = EM.json(page_path(pn), key='breadth_p%03d' % pn, timeout=25, budget=90)
+        j = EM.json(page_path(pn), key='breadth_p%03d' % pn, timeout=8, budget=20)
         d = (j.get('data') or {})
         return (d.get('diff') or []), d.get('total')
 
-    # 第 1 页用于拿到总数，据此决定要翻多少页。它是整段抓取的闸门，多试几次。
+    # 第 1 页用于拿到总数。内层已经会换主机，这里只再试一次瞬时失败。
     first, total = None, None
-    for attempt in range(4):
+    for attempt in range(2):
         try:
             first, total = get_page(1)
             if first:
                 break
         except Exception as e:
-            warn('市场宽度第1页抓取失败（第 %d/4 次）: %r' % (attempt + 1, e))
-        if attempt < 3:
-            time.sleep(3)
+            warn('市场宽度第1页抓取失败（第 %d/2 次）: %r' % (attempt + 1, e))
+        if attempt == 0:
+            time.sleep(0.3)
     if not first:
         warn('市场宽度第1页始终失败，本次跳过该章节（直接重跑即可续抓）')
         return [], (total or 0), 0
@@ -534,7 +674,7 @@ def fetch_breadth(max_pages=70, page_size=100, workers=8):
     # 第二轮补抓：降低并发、放慢节奏，专治瞬时抖动（代理/限流）
     if failed:
         log('  首轮有 %d 页失败，开始第二轮补抓 ...' % len(failed))
-        time.sleep(2)
+        time.sleep(0.3)
         failed = run_pass(failed, max(1, min(3, workers // 2)))
 
     if failed:
@@ -915,7 +1055,8 @@ def build_signals(a, idx, turnover_hist, glob):
 
 
 # ================================================================ 摘要数据
-def build_summary(a, idx, boards, sup, pre, lv, trade_date, report_path):
+def build_summary(a, idx, boards, sup, pre, lv, trade_date, report_path,
+                  flows=None, pick=None, turnover_hist=None):
     """把关键盘面数据抽成结构化摘要，供飞书推送 / 二次分析使用。"""
     def g(code):
         d = idx.get(code)
@@ -925,9 +1066,21 @@ def build_summary(a, idx, boards, sup, pre, lv, trade_date, report_path):
                 'pct': round(d['pct'], 2), 'amount': d['amount']}
 
     def top(key, n=4):
-        rows = boards.get(key) or []
-        return [{'name': x['name'], 'pct': round(x['pct'], 2),
-                 'flow_yi': round(x['flow'] / 1e8, 1)} for x in rows[:n]]
+        """涨幅榜去重（航空装备Ⅱ/Ⅲ 只留一条），并带上主力净额，避免只看涨幅。"""
+        picked, seen = [], set()
+        for x in boards.get(key) or []:
+            raw = x.get('name') or ''
+            if _skip_board(raw):
+                continue
+            name = _board_base(raw) or raw
+            if name in seen:
+                continue
+            seen.add(name)
+            picked.append({'name': name, 'pct': round(fnum(x.get('pct')), 2),
+                           'flow_yi': round(fnum(x.get('flow')) / 1e8, 1)})
+            if len(picked) >= n:
+                break
+        return picked
 
     f = a.get('flow') or {}
     mg = (a.get('margin') or [{}])[0]
@@ -936,7 +1089,8 @@ def build_summary(a, idx, boards, sup, pre, lv, trade_date, report_path):
         'report_path': report_path,
         'indices': {
             'sh': g('sh000001'), 'sz': g('sz399001'), 'cyb': g('sz399006'),
-            'kc50': g('sh000688'), 'hs300': g('sh000300'), 'zz500': g('sh000905'),
+            'kc50': g('sh000688'), 'hs300': g('sh000300'), 'sz50': g('sh000016'),
+            'zz500': g('sh000905'),
             'zz1000': g('sh000852'), 'gz2000': g('sz399303'), 'bj50': g('bj899050'),
         },
         'turnover_yi': round(a['amount_2m'] / 1e8, 0),
@@ -946,6 +1100,7 @@ def build_summary(a, idx, boards, sup, pre, lv, trade_date, report_path):
             'up': a['up'], 'down': a['down'], 'flat': a['flat'],
             'median_pct': round(a['median'], 2),
             'limit_up': a['pools'].get('zt'), 'limit_dn': a['pools'].get('dt'),
+            'limit_up_px': a.get('limit_up'), 'limit_dn_px': a.get('limit_dn'),
             'broken': a['pools'].get('zb'),
             'broken_rate': round(a['zbl'], 0) if a.get('zbl') is not None else None,
         },
@@ -960,7 +1115,11 @@ def build_summary(a, idx, boards, sup, pre, lv, trade_date, report_path):
                     'concept_up': top('con_up'), 'concept_dn': top('con_dn')},
         'signals': {'support': sup, 'pressure': pre},
         'levels': lv,
+        'pick': pick if pick is not None else build_pick(boards, flows or {}, a, lv),
     }
+    if turnover_hist and len(turnover_hist) >= 2 and turnover_hist[-2][2]:
+        s['turnover_sh_chg_pct'] = round(
+            (a['amount_sh'] / turnover_hist[-2][2] - 1) * 100, 1)
     return s
 
 
@@ -969,8 +1128,163 @@ def yi(v):
     return '%.1f亿' % (v / 1e8) if abs(v) >= 1e8 else '%.0f万' % (v / 1e4)
 
 
+def na(v, fmt=None):
+    """空值显示成破折号。直接 %s 会把 None 印成字符串 None。"""
+    if v is None:
+        return '—'
+    return (fmt % v) if fmt else ('%s' % v)
+
+
+# 指数篮子、事件标签、连板情绪，不是可交易的行业或主题
+_SKIP_BOARD_PARTS = (
+    '昨日', '连板', '炸板', '触板', '高换手', 'ST', '富时', 'MSCI', '深成',
+    '沪深300', '中证', '上证50', '上证180', '深股通', '沪股通', '融资融券',
+    '预增', '预减', '首亏', '标准普尔', '罗素', '中盘', '大盘股', '周期股',
+    '贬值受益', '转融券', '标普',
+)
+_BOARD_SUFFIX = re.compile(u'[ⅠⅡⅢⅣⅤ]+$')
+
+
+def _board_base(name):
+    """航空装备Ⅲ / 航空装备Ⅱ 视为同一个板块。"""
+    return _BOARD_SUFFIX.sub('', name or '').strip()
+
+
+def _skip_board(name):
+    if not name:
+        return True
+    for part in _SKIP_BOARD_PARTS:
+        if part in name:
+            return True
+    return False
+
+
+def _flow_text(row):
+    v = row['flow'] / 1e8
+    if abs(v) < 0.05:
+        move = '主力净额 0.0 亿'
+    elif v > 0:
+        move = '主力净流入 %.1f 亿' % v
+    else:
+        move = '主力净流出 %.1f 亿' % abs(v)
+    return '%s（%s）%+.2f%%，%s' % (row['name'], row['kind'], row['pct'], move)
+
+
+def build_pick(boards, flows, a, lv):
+    """只推荐一项：涨幅和主力净流入必须同时成立。
+
+    门槛写在明面上：涨幅 ≥ 1%，且主力净流入 ≥ 5 亿。
+    只在已经抓到的资金榜、涨幅榜里比较，不补榜外的板块。
+    涨得多但资金没进的，资金进了但价格没动的，都单独写出来，不混进推荐。
+    """
+    seen = set()
+    inflow = []
+
+    def take(kind, rows, bucket):
+        for x in rows or []:
+            raw = x.get('name') or ''
+            if _skip_board(raw):
+                continue
+            base = _board_base(raw) or raw
+            key = (kind, base)
+            if key in seen:
+                continue
+            seen.add(key)
+            bucket.append({
+                'name': base,
+                'kind': kind,
+                'pct': fnum(x.get('pct')),
+                'flow': fnum(x.get('flow')),
+            })
+
+    take('行业', (flows or {}).get('industry_in'), inflow)
+    take('概念', (flows or {}).get('concept_in'), inflow)
+    confirmed = [x for x in inflow if x['pct'] >= 1.0 and x['flow'] >= 5e8]
+    confirmed.sort(key=lambda x: x['flow'], reverse=True)
+    # 资金很大，但涨幅没有到 1%，价格还没确认
+    unconfirmed = [x for x in inflow
+                   if x['flow'] >= 1e9 and -0.5 < x['pct'] < 1.0]
+    unconfirmed.sort(key=lambda x: x['flow'], reverse=True)
+
+    chasers = []
+    take('行业', (boards or {}).get('ind_up'), chasers)
+    take('概念', (boards or {}).get('con_up'), chasers)
+    chasers = [x for x in chasers if x['pct'] >= 3.0 and x['flow'] <= 0]
+    chasers.sort(key=lambda x: x['pct'], reverse=True)
+
+    outflow = []
+    take('行业', (flows or {}).get('industry_out'), outflow)
+    take('概念', (flows or {}).get('concept_out'), outflow)
+    outflow = [x for x in outflow if x['flow'] < 0]
+    outflow.sort(key=lambda x: x['flow'])
+
+    notes = []
+    m = (a.get('ma') or {}).get('上证指数') or {}
+    mas = [m.get(k) for k in ('ma5', 'ma10', 'ma20', 'ma60')]
+    mas = [x for x in mas if x]
+    if m.get('close') and mas and m['close'] < min(mas):
+        notes.append('上证收在 MA5/MA10/MA20/MA60 全部下方')
+    main = (a.get('flow') or {}).get('main')
+    if main is not None and main < 0:
+        notes.append('两市主力净流出 %.0f 亿' % (abs(main) / 1e8))
+    if a.get('zbl') is not None and a['zbl'] >= 30:
+        notes.append('炸板率 %.0f%%' % a['zbl'])
+    mg = a.get('margin') or []
+    if len(mg) >= 3 and mg[0].get('total') and mg[2].get('total') and mg[0]['total'] < mg[2]['total']:
+        notes.append('两融从 %s 的 %.0f 亿降到 %s 的 %.0f 亿'
+                     % (mg[2].get('date') or '较早', mg[2]['total'] / 1e8,
+                        mg[0].get('date') or '最新', mg[0]['total'] / 1e8))
+    hostile = len(notes) >= 2
+
+    pick = confirmed[0] if confirmed else None
+    if pick and hostile:
+        stance = '防守观察，不追高'
+    elif pick:
+        stance = '顺势关注'
+    else:
+        stance = '今天不推荐方向'
+
+    lines = []
+    if pick:
+        lines.append('入选原因：%s。在已抓到的资金榜里，涨幅不低于 1%% 且主力净流入不低于 5 亿，净流入最高。'
+                     % _flow_text(pick))
+        rel = [_flow_text(x) for x in confirmed[1:5]]
+        if rel:
+            lines.append('同一条件还成立的：%s。' % '；'.join(rel))
+    else:
+        lines.append('已抓到的资金榜里，没有板块同时满足涨幅 ≥ 1% 且主力净流入 ≥ 5 亿，所以不硬凑一项。')
+    if unconfirmed:
+        lines.append('资金更大或相近、但涨幅没到 1%%，不列入推荐：%s。'
+                     % '；'.join(_flow_text(x) for x in unconfirmed[:2]))
+    if chasers:
+        lines.append('涨幅靠前但主力没有净流入，不列入推荐：%s。' % _flow_text(chasers[0]))
+    if outflow:
+        lines.append('资金在撤的方向：%s。' % _flow_text(outflow[0]))
+    support = (lv or {}).get('support') or []
+    resist = (lv or {}).get('resistance') or []
+    risk = []
+    if support:
+        risk.append('上证跌破 %.0f 则这项观察失效' % support[0])
+    if resist and len(resist) >= 2:
+        risk.append('上方压力 %.0f–%.0f' % (resist[0], resist[1]))
+    if notes:
+        risk.append('，'.join(notes))
+    if risk:
+        lines.append('边界：%s。推荐的是板块，不是某一只股票。' % '；'.join(risk))
+
+    out = {
+        'stance': stance,
+        'name': pick['name'] if pick else None,
+        'kind': pick['kind'] if pick else None,
+        'pct': round(pick['pct'], 2) if pick else None,
+        'flow_yi': round(pick['flow'] / 1e8, 1) if pick else None,
+        'lines': lines,
+    }
+    return out
+
+
 def render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date,
-           signals=None):
+           signals=None, pick=None):
     L = []
     add = L.append
     sh = idx.get('sh000001') or {}
@@ -1018,9 +1332,10 @@ def render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date,
     add('| 有效报价 / 全市场 | %d / %s 只（其余 %s 只停牌或无报价） |'
         % (a['n'], a.get('total_all', a['n']), a.get('suspended', 0)))
     add('| 上涨 / 下跌 / 平盘 | **%d / %d / %d** |' % (a['up'], a['down'], a['flat']))
-    add('| 涨停 / 跌停（涨停池口径） | %s / %s |' % (a['pools'].get('zt', '—'), a['pools'].get('dt', '—')))
+    add('| 涨停 / 跌停（涨停池口径） | %s / %s |'
+        % (na(a['pools'].get('zt')), na(a['pools'].get('dt'))))
     add('| 炸板家数 / 炸板率 | %s / %s |'
-        % (a['pools'].get('zb', '—'), ('%.0f%%' % a['zbl']) if a.get('zbl') is not None else '—'))
+        % (na(a['pools'].get('zb')), na(a.get('zbl'), '%.0f%%')))
     add('| 涨幅≥9.8%% / 跌幅≤-9.8%% | %d / %d |' % (a['limit_up'], a['limit_dn']))
     add('| 涨超5%% / 跌超5%% | %d / %d |' % (a['big_up'], a['big_dn']))
     add('| 中位涨跌幅 / 平均涨跌幅 | %+.2f%% / %+.2f%% |' % (a['median'], a['mean']))
@@ -1191,6 +1506,22 @@ def render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date,
         add('- 今日振幅区间：%.2f – %.2f' % (lv.get('low', 0), lv.get('high', 0)))
         add('')
 
+    pick = build_pick(boards, flows, a, lv) if pick is None else pick
+    add('### 推荐关注（仅一项）')
+    add('')
+    add('> 只在已抓到的资金榜里比较。门槛：涨幅 ≥ 1%，且主力净流入 ≥ 5 亿。')
+    add('> 指数篮子、昨日连板、预增预减这类标签不参与。下面是当日资金落点，不是买卖指令。')
+    add('')
+    if pick.get('name'):
+        add('**%s（%s）**　%+.2f%%　主力净流入 %.1f 亿' % (
+            pick['name'], pick.get('kind') or '', pick.get('pct') or 0, pick.get('flow_yi') or 0))
+        add('')
+    add('**立场**：%s' % pick.get('stance'))
+    add('')
+    for line in pick.get('lines') or []:
+        add('- %s' % line)
+    add('')
+
     # ---------------- 十、缺口与声明
     if ERRORS:
         add('## 十、数据缺口')
@@ -1313,123 +1644,185 @@ def main():
             except Exception:
                 pass
 
-    # 3) 轻量预热：只探首号主机一次，失败也不阻塞
-    #    （离线模式跳过；缓存已就绪时也无需探测，可直接省下一次往返）
+    # 3) 挑一台能用的行情主机。离线或缓存已齐时跳过。
+    #    只探第一台的话，那台一慢，后面每个请求都会先白等一轮。
     try:
         n_cached = len(os.listdir(cachedir)) if os.path.isdir(cachedir) else 0
     except Exception:
         n_cached = 0
-    if not OFFLINE[0] and (args.refresh or n_cached < 5):
-        try:
-            probe = ('https://%s/api/qt/clist/get?pn=1&pz=1&po=1&np=1&fltt=2&invt=2'
-                     '&fid=f3&fs=m:1+t:2&fields=f3,f14&ut=%s' % (EM_HOSTS[0], EM_UT))
-            http_json(probe, referer='https://quote.eastmoney.com/', timeout=8, retries=1)
-            EM.good = EM_HOSTS[0]
-            log('行情主机 = %s' % EM.good)
-        except Exception:
-            log('行情主机预热未命中（不阻塞，后续按需自动切换）')
-    elif not OFFLINE[0]:
-        log('缓存已就绪（%d 个文件），跳过行情主机预热' % n_cached)
+    if not OFFLINE[0]:
+        saved = load_saved_quote_host(base)
+        EM.set_slots(max(4, args.workers))
+        if args.refresh or n_cached < 5:
+            host = probe_quote_host()
+            if host:
+                log('行情主机 = %s' % host)
+        else:
+            extra = ('，沿用 %s' % saved) if saved else ''
+            log('缓存已就绪（%d 个文件），跳过行情主机预热%s' % (n_cached, extra))
 
-    # 4) 板块（并发抓取，批次级重试）
-    boards, flows = {}, {}
+    # 4) 彼此独立的数据一起抓。以前要等板块、资金、均线都结束才开始全市场分页，
+    #    飞书又要等新闻写完报告才发。现在关键数据一齐就先推，新闻和商品并行补齐。
+    jobs = {}
+    labels = {
+        'boards': '板块涨跌', 'flows': '板块资金', 'breadth': '市场宽度',
+        'src': '资金与外围', 'kline': '均线', 'news': '新闻', 'comm': '商品汇率',
+    }
+
+    def _bg(name, fn):
+        box = {'t0': time.time()}
+
+        def run():
+            try:
+                box['value'] = fn()
+            except Exception as e:
+                box['err'] = e
+            box['sec'] = time.time() - box['t0']
+
+        th = threading.Thread(target=run, name='fetch-' + name)
+        th.start()
+        jobs[name] = (th, box)
+
+    def _join(name, fallback):
+        th, box = jobs[name]
+        th.join()
+        if box.get('err') is not None:
+            warn('%s 抓取失败: %r' % (labels.get(name, name), box['err']))
+            return fallback, box.get('sec') or 0.0
+        return box.get('value'), box.get('sec') or 0.0
+
     bspec = [('ind_up', 'industry', 1), ('ind_dn', 'industry', 0),
              ('con_up', 'concept', 1), ('con_dn', 'concept', 0)]
-    def _fetch_boards():
-        res = parallel_map(lambda sp: fetch_board(sp[1], po=sp[2], size=args.top),
-                           bspec, args.workers)
-        return res if any(r is not None for r in res) else None
-    bres = retry_call(_fetch_boards, attempts=3, delay=4.0, label='板块涨跌') or [None] * len(bspec)
-    for (key, kind, po), r in zip(bspec, bres):
-        if r is not None:
-            boards[key] = r
-        else:
-            warn('板块涨跌(%s)抓取失败' % key)
     fspec = [('industry_in', 'industry', 1), ('industry_out', 'industry', 0),
              ('concept_in', 'concept', 1), ('concept_out', 'concept', 0)]
-    def _fetch_flows():
-        res = parallel_map(lambda sp: fetch_board_flow(sp[1], po=sp[2], size=8),
-                           fspec, args.workers)
-        return res if any(r is not None for r in res) else None
-    fres = retry_call(_fetch_flows, attempts=3, delay=4.0, label='板块资金') or [None] * len(fspec)
-    for (key, kind, po), r in zip(fspec, fres):
-        if r is not None:
-            flows[key] = r
-        else:
-            warn('板块资金(%s)抓取失败' % key)
 
-    # 5) 主力资金 / 两融 / 涨跌停池 / 外围 / 商品：彼此独立，一次并发抓完
-    #    （原先这 5 个源是串行请求，是整条链路上最大的一块可压缩等待时间）
-    src = fetch_all_sources([
-        ('主力资金', fetch_market_flow),
-        ('两融数据', fetch_margin),
-        ('涨跌停池', lambda: fetch_pools(trade_compact)),
-        ('外围市场', fetch_global),
-        ('商品/汇率', fetch_commodity_fx),
-    ], args.workers)
+    def _do_boards():
+        boards = {}
+
+        def _fetch():
+            res = parallel_map(lambda sp: fetch_board(sp[1], po=sp[2], size=args.top),
+                               bspec, args.workers)
+            return res if any(r is not None for r in res) else None
+
+        bres = retry_call(_fetch, label='板块涨跌') or [None] * len(bspec)
+        for (key, kind, po), r in zip(bspec, bres):
+            if r is not None:
+                boards[key] = r
+            else:
+                warn('板块涨跌(%s)抓取失败' % key)
+        return boards
+
+    def _do_flows():
+        flows = {}
+
+        def _fetch():
+            res = parallel_map(lambda sp: fetch_board_flow(sp[1], po=sp[2], size=8),
+                               fspec, args.workers)
+            return res if any(r is not None for r in res) else None
+
+        fres = retry_call(_fetch, label='板块资金') or [None] * len(fspec)
+        for (key, kind, po), r in zip(fspec, fres):
+            if r is not None:
+                flows[key] = r
+            else:
+                warn('板块资金(%s)抓取失败' % key)
+        return flows
+
+    def _do_breadth():
+        if args.no_breadth:
+            return [], 0, 0
+        log('抓取全市场个股（最多 %d 页，已缓存的可跳过）...' % args.pages)
+        try:
+            rows, total, suspended = fetch_breadth(max_pages=args.pages,
+                                                   workers=args.workers)
+            log('  可取报价 %d 只 / 全市场 %s 只（停牌无报价 %d 只）'
+                % (len(rows), total, suspended))
+            return rows, total, suspended
+        except Exception as e:
+            warn('市场宽度抓取失败: %r' % (e,))
+            return [], 0, 0
+
+    def _do_src():
+        return fetch_all_sources([
+            ('主力资金', fetch_market_flow),
+            ('两融数据', fetch_margin),
+            ('涨跌停池', lambda: fetch_pools(trade_compact)),
+            ('外围市场', fetch_global),
+        ], args.workers)
+
+    def _do_kline():
+        kl, turnover_hist = {}, []
+        kspec = [(nm, secid) for _, nm, secid in INDICES if secid]
+        kres = parallel_map(lambda sp: fetch_kline(sp[1], lmt=70), kspec, args.workers)
+        for (nm, secid), r in zip(kspec, kres):
+            if r:
+                kl[secid] = r
+            else:
+                warn('%s K线抓取失败' % nm)
+        try:
+            turnover_hist = fetch_turnover_history('1.000001', lmt=10)
+        except Exception as e:
+            warn('成交额历史抓取失败: %r' % (e,))
+        return kl, turnover_hist
+
+    def _do_news():
+        if args.no_news:
+            return []
+        log('抓取快讯 ...')
+        try:
+            rows = fetch_news(max_pages=args.news_pages)
+            log('  取到 %d 条' % len(rows))
+            return rows
+        except Exception as e:
+            warn('新闻抓取失败: %s' % e)
+            return []
+
+    def _do_comm():
+        try:
+            return fetch_commodity_fx()
+        except Exception as e:
+            warn('商品/汇率抓取失败: %r' % (e,))
+            return {}
+
+    log('并发抓取板块、资金、全市场、均线、消息 ...')
+    _bg('boards', _do_boards)
+    _bg('flows', _do_flows)
+    _bg('breadth', _do_breadth)
+    _bg('src', _do_src)
+    _bg('kline', _do_kline)
+    _bg('news', _do_news)
+    _bg('comm', _do_comm)
+
+    # 飞书卡片要用来做推荐，板块资金榜必须先到齐；新闻和商品仍可后补
+    boards, sec_boards = _join('boards', {})
+    flows, sec_flows = _join('flows', {})
+    bval, sec_breadth = _join('breadth', ([], 0, 0))
+    breadth, total_all, suspended = bval
+    src, sec_src = _join('src', {})
+    src = src or {}
+    kval, sec_k = _join('kline', ({}, []))
+    kl, turnover_hist = kval
     market_flow = src.get('主力资金')
     margin = src.get('两融数据') or []
     pools = src.get('涨跌停池') or {}
     glob = src.get('外围市场') or []
-    comm = src.get('商品/汇率') or {}
+    log('关键数据就绪（宽度 %.1fs / 板块 %.1fs / 板块资金 %.1fs / 资金外围 %.1fs / 均线 %.1fs）'
+        % (sec_breadth, sec_boards, sec_flows, sec_src, sec_k))
 
-    # 6) 均线 + 成交额历史（并发抓取）
-    kl, turnover_hist = {}, []
-    kspec = [(nm, secid) for _, nm, secid in INDICES if secid]
-    kres = parallel_map(lambda sp: fetch_kline(sp[1], lmt=70), kspec, args.workers)
-    for (nm, secid), r in zip(kspec, kres):
-        if r:
-            kl[secid] = r
-        else:
-            warn('%s K线抓取失败' % nm)
-    try:
-        turnover_hist = fetch_turnover_history('1.000001', lmt=10)
-    except Exception as e:
-        warn('成交额历史抓取失败: %r' % (e,))
-
-    # 8) 市场宽度（最重，约 60 页，放在最后）
-    breadth, total_all, suspended = [], 0, 0
-    if not args.no_breadth:
-        log('抓取全市场个股（最多 %d 页，已缓存的可跳过）...' % args.pages)
-        try:
-            breadth, total_all, suspended = fetch_breadth(max_pages=args.pages,
-                                                          workers=args.workers)
-            log('  可取报价 %d 只 / 全市场 %s 只（停牌无报价 %d 只）'
-                % (len(breadth), total_all, suspended))
-        except Exception as e:
-            warn('市场宽度抓取失败: %r' % (e,))
-
-    # 9) 新闻
-    news = []
-    if not args.no_news:
-        log('抓取快讯 ...')
-        try:
-            news = fetch_news(max_pages=args.news_pages)
-            log('  取到 %d 条' % len(news))
-        except Exception as e:
-            warn('新闻抓取失败: %s' % e)
-
-    # 10) 分析 + 渲染
-    log('计算指标并生成报告 ...')
     if not breadth:
-        # 无宽度数据时给个空壳，保证报告仍能生成
         breadth = []
     a = analyze(breadth, idx, market_flow, margin, pools, kl)
     a['total_all'] = total_all
     a['suspended'] = suspended
     sup, pre, lv = build_signals(a, idx, turnover_hist, glob)
-    md = render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date,
-                signals=(sup, pre, lv))
+    pick = build_pick(boards, flows or {}, a, lv)
 
-    outdir = args.dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
+    outdir = args.dir or os.path.join(base, 'reports')
     if not os.path.isdir(outdir):
         os.makedirs(outdir)
     outpath = args.out or os.path.join(outdir, 'A股复盘_%s.md' % trade_date)
-    with codecs.open(outpath, 'w', 'utf-8') as fp:
-        fp.write(md)
-
-    # 结构化摘要（供推送 / 二次分析使用，避免去解析 Markdown）
-    summary = build_summary(a, idx, boards, sup, pre, lv, trade_date, outpath)
+    summary = build_summary(a, idx, boards, sup, pre, lv, trade_date, outpath,
+                            flows=flows, pick=pick, turnover_hist=turnover_hist)
     jsonpath = os.path.splitext(outpath)[0] + '.summary.json'
     try:
         with codecs.open(jsonpath, 'w', 'utf-8') as fp:
@@ -1437,18 +1830,15 @@ def main():
     except Exception as e:
         warn('摘要 JSON 写入失败: %r' % (e,))
 
-    log('完成，用时 %.1f 秒' % (time.time() - t0))
-    print('报告已生成: %s' % outpath)
-
     if not args.quiet:
         print('')
         print('=' * 60)
         print('  盘面速览  %s' % trade_date)
         print('=' * 60)
         for code, nm, _ in INDICES[:7]:
-            d = idx.get(code)
-            if d:
-                print('  %-8s %10.2f  %+7.2f%%' % (nm, d['price'], d['pct']))
+            quote = idx.get(code)
+            if quote:
+                print('  %-8s %10.2f  %+7.2f%%' % (nm, quote['price'], quote['pct']))
         if a['n']:
             print('  上涨/下跌      %d / %d   中位数 %+.2f%%' % (a['up'], a['down'], a['median']))
         print('  两市成交额     %.0f 亿' % (a['amount_2m'] / 1e8))
@@ -1456,24 +1846,50 @@ def main():
             print('  主力净额       %+.0f 亿' % (a['flow']['main'] / 1e8))
         if a.get('zbl') is not None:
             print('  炸板率         %.0f%%' % a['zbl'])
+        pk = summary.get('pick') or {}
+        if pk.get('name'):
+            print('  推荐观察       %s（%s） %+.2f%%  主力%+.1f亿  [%s]'
+                  % (pk['name'], pk.get('kind') or '', pk.get('pct') or 0,
+                     pk.get('flow_yi') or 0, pk.get('stance') or ''))
+        elif pk.get('stance'):
+            print('  推荐观察       %s' % pk['stance'])
         print('=' * 60)
-        print('  报告: %s' % outpath)
 
-    # 飞书推送
     if args.push or args.push_dry_run:
         try:
             import feishu_push
         except ImportError:
             warn('未找到 feishu_push.py，跳过推送')
         else:
-            rc = feishu_push.push_file(
-                jsonpath,
-                config_path=args.push_config,
-                dry_run=args.push_dry_run,
-                provider=args.push_provider,
-            )
-            if rc != 0 and not args.push_dry_run:
-                warn('飞书推送未成功（返回码 %s）' % rc)
+            try:
+                log('推送飞书 ...')
+                t_push = time.time()
+                rc = feishu_push.push(
+                    summary,
+                    feishu_push.load_config(args.push_config),
+                    provider=args.push_provider,
+                    dry_run=args.push_dry_run,
+                )
+                if not args.push_dry_run:
+                    log('飞书推送 %.1f 秒' % (time.time() - t_push))
+                if rc != 0 and not args.push_dry_run:
+                    warn('飞书推送未成功（返回码 %s）' % rc)
+            except Exception as e:
+                warn('飞书推送异常: %r' % (e,))
+
+    news, sec_news = _join('news', [])
+    comm, sec_comm = _join('comm', {})
+    news = news or []
+    comm = comm or {}
+    log('其余数据就绪（商品 %.1fs / 新闻 %.1fs）' % (sec_comm, sec_news))
+
+    md = render(a, idx, boards, flows, news, glob, comm, turnover_hist, trade_date,
+                signals=(sup, pre, lv), pick=pick)
+    with codecs.open(outpath, 'w', 'utf-8') as fp:
+        fp.write(md)
+
+    log('完成，用时 %.1f 秒' % (time.time() - t0))
+    print('报告已生成: %s' % outpath)
     return 0
 
 

@@ -21,6 +21,8 @@ import os
 import sys
 import json
 import copy
+import shutil
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -185,6 +187,37 @@ def main():
        (a['up'], a['down']))
     eq('summary: 主力资金(亿)', sm['fund']['main_yi'], round(-1.65e10 / 1e8, 1))
     check('summary: 领涨板块', bool(sm['leaders']['industry_up']))
+    eq('空值不印成 None', sr.na(None), '—')
+    eq('板块名去掉罗马数字后缀', sr._board_base('航空装备Ⅲ'), '航空装备')
+    eq('板块名去掉另一后缀', sr._board_base('航空装备Ⅱ'), '航空装备')
+
+    pick = sr.build_pick(
+        {'ind_up': [{'name': '燃料电池', 'pct': 6.56, 'flow': 0},
+                    {'name': '航空装备Ⅲ', 'pct': 5.98, 'flow': 17.5e8},
+                    {'name': '航空装备Ⅱ', 'pct': 5.98, 'flow': 17.5e8}]},
+        {'concept_in': [{'name': '半导体概念', 'pct': -0.18, 'flow': 39.8e8},
+                        {'name': '军工', 'pct': 2.5, 'flow': 37.2e8},
+                        {'name': '低空经济', 'pct': 2.45, 'flow': 33.1e8}],
+         'industry_in': [{'name': '半导体', 'pct': 0.2, 'flow': 34.2e8},
+                         {'name': '国防军工', 'pct': 4.46, 'flow': 29.3e8}],
+         'industry_out': [{'name': '传媒', 'pct': -1.2, 'flow': -36.8e8}],
+         'concept_out': [{'name': '富时罗素', 'pct': 0.41, 'flow': -62.4e8}]},
+        a, {'support': [3681.0], 'resistance': [3758.0, 3882.0]})
+    eq('推荐项是价和资金同时成立的军工', pick['name'], '军工')
+    eq('推荐项类别', pick['kind'], '概念')
+    eq('推荐项净流入', pick['flow_yi'], 37.2)
+    eq('弱市立场是观察而不是追', pick['stance'], '防守观察，不追高')
+    pick_text = '\n'.join(pick['lines'])
+    check('推荐项说明为何不选半导体', '半导体概念' in pick_text and '不列入推荐' in pick_text)
+    check('推荐项说明为何不选燃料电池', '燃料电池' in pick_text)
+    check('推荐项写明资金撤出的传媒', '传媒' in pick_text)
+    check('推荐项不把指数篮子当方向', '富时罗素' not in pick_text)
+    check('推荐项写明失效价', '3681' in pick_text)
+    empty_pick = sr.build_pick({}, {}, a, {})
+    eq('没有同时成立的板块就不推荐', empty_pick['name'], None)
+    eq('空榜立场', empty_pick['stance'], '今天不推荐方向')
+    check('render: 含推荐关注', '推荐关注（仅一项）' in md)
+    check('render: 推荐用了资金榜而不是只看涨幅', '医疗' in md and '主力净流入' in md)
 
     # ---- parse_sina_lines ----
     txt = ('var hq_str_sh000001="上证指数,3880.0,3888.0,3885.0,3900.0,3867.0,0,0,0,'
@@ -267,6 +300,64 @@ def main():
     eq('should_push: always', fp.should_push(sm, 'always'), (True, ''))
     check('should_push: pressure 阈值生效',
           fp.should_push(sm, 'pressure')[0] == (len(sup if False else pre) >= 3))
+
+    # ---- 行情主机：缓存命中不触网；坏主机每台只试一次 ----
+    print('=== 抓取耗时相关 ===')
+    order = sr._JsonFetcher(hosts=['h1', 'h2', 'h3'])
+    order.good = 'h2'
+    eq('主机顺序: 优先上次成功', order._ordered_hosts(), ['h2', 'h1', 'h3'])
+    order.good = 'nope'
+    eq('主机顺序: 未知主机则按原列表', order._ordered_hosts(), ['h1', 'h2', 'h3'])
+    eq('主机顺序: 直连 URL', sr._JsonFetcher(hosts=None)._ordered_hosts(), [None])
+
+    tmp = tempfile.mkdtemp(prefix='sr-cache-')
+    try:
+        fetcher = sr._JsonFetcher(hosts=['no-such-host'], cache_dir=tmp,
+                                  timeout=1, budget=1, pace=0, slots=1)
+        with open(os.path.join(tmp, 'k.json'), 'wb') as fp_cache:
+            fp_cache.write(b'{"ok": 1}')
+        eq('缓存命中不触网', fetcher.json('/unused', key='k'), {'ok': 1})
+        sr.OFFLINE[0] = True
+        try:
+            raised = False
+            try:
+                fetcher.json('/nope', key='missing')
+            except Exception:
+                raised = True
+            check('离线缺缓存立即失败', raised)
+        finally:
+            sr.OFFLINE[0] = False
+    finally:
+        shutil.rmtree(tmp)
+
+    calls = []
+    real_http_json = sr.http_json
+
+    def _down(url, referer=None, timeout=12, retries=2):
+        calls.append(url)
+        raise Exception('down')
+
+    sr.http_json = _down
+    try:
+        multi = sr._JsonFetcher(hosts=['h1.example', 'h2.example'],
+                                timeout=1, budget=5, pace=0, slots=1)
+        try:
+            multi.json('/x', key='no-cache')
+        except Exception:
+            pass
+        eq('多主机每台只试一次', len(calls), 2)
+        check('多主机先试列表第一台', calls and 'h1.example' in calls[0])
+
+        calls[:] = []
+        single = sr._JsonFetcher(hosts=['only.example'], retries=2,
+                                 timeout=1, budget=5, pace=0, slots=1)
+        try:
+            single.json('/x', key='no-cache-2')
+        except Exception:
+            pass
+        eq('单主机按次数重试', len(calls), 2)
+    finally:
+        sr.http_json = real_http_json
 
     # ---- 结果 ----
     print('')

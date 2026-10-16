@@ -121,7 +121,7 @@ def _ascii(s):
     return s.encode('ascii', 'replace').decode('ascii')
 
 
-def http_post(url, json_body=None, data=None, headers=None, timeout=20, retries=3):
+def http_post(url, json_body=None, data=None, headers=None, timeout=10, retries=2):
     """POST，返回 (status, 文本)。网络层失败自动重试。
 
     注意：JSON body 一律用 ensure_ascii=True 序列化。带中文的原始 UTF-8 body
@@ -161,7 +161,7 @@ def http_post(url, json_body=None, data=None, headers=None, timeout=20, retries=
                 return getattr(e, 'code', 0), txt
             last = e
             if i < retries - 1:        # 最后一次失败不再空等，直接抛出
-                time.sleep(1.0 * (i + 1))
+                time.sleep(0.35 * (i + 1))
     raise Exception('network error after %d retries: %s: %s'
                     % (retries, _ascii(type(last).__name__), _ascii('%s' % (last,))))
 
@@ -296,6 +296,9 @@ def build_card(sm, title=None):
     row = [x for x in (pc('sz'), pc('cyb'), pc('kc50')) if x]
     if row:
         l1.append(' | '.join(row))
+    mid = [x for x in (pc('hs300'), pc('sz50'), pc('zz500')) if x]
+    if mid:
+        l1.append(' | '.join(mid))
     small = [x for x in (pc('zz1000'), pc('gz2000')) if x]
     if small:
         l1.append('小盘：' + ' | '.join(small))
@@ -304,11 +307,21 @@ def build_card(sm, title=None):
     s1 = '\n'.join(l1)
 
     # --- 区块 2：量能与资金
-    l2 = ['**成交** %s亿　**涨跌** %s↑ / %s↓（中位 %+.2f%%）'
-          % (sm.get('turnover_yi'), br.get('up'), br.get('down'), br.get('median_pct') or 0),
+    chg = sm.get('turnover_sh_chg_pct')
+    turn = '**成交** %s亿' % sm.get('turnover_yi')
+    if chg is not None:
+        turn += '（沪市较前日 %+.1f%%）' % chg
+    def _cnt(pool, px):
+        if pool is not None:
+            return '%s' % pool
+        if px is not None:
+            return '%s（≥9.8%%）' % px
+        return '—'
+    l2 = ['%s　**涨跌** %s↑ / %s↓（中位 %+.2f%%）'
+          % (turn, br.get('up'), br.get('down'), br.get('median_pct') or 0),
           '**情绪** 涨停%s　跌停%s　炸板率%s'
-          % (br.get('limit_up') if br.get('limit_up') is not None else '—',
-             br.get('limit_dn') if br.get('limit_dn') is not None else '—',
+          % (_cnt(br.get('limit_up'), br.get('limit_up_px')),
+             _cnt(br.get('limit_dn'), br.get('limit_dn_px')),
              ('%s%%' % br.get('broken_rate')) if br.get('broken_rate') is not None else '—')]
     if fd.get('main_yi') is not None:
         l2.append('**主力** 净%s %s亿'
@@ -320,7 +333,13 @@ def build_card(sm, title=None):
     # --- 区块 3：板块
     def brief(key, n=4, sep=' / '):
         rows = ld.get(key) or []
-        return sep.join('%s%+.1f%%' % (x['name'], x['pct']) for x in rows[:n])
+        parts = []
+        for x in rows[:n]:
+            if x.get('flow_yi') is None:
+                parts.append('%s%+.1f%%' % (x['name'], x['pct']))
+            else:
+                parts.append('%s%+.1f%%（%+.1f亿）' % (x['name'], x['pct'], x['flow_yi']))
+        return sep.join(parts)
 
     l3 = []
     if ld.get('industry_up'):
@@ -330,6 +349,20 @@ def build_card(sm, title=None):
     if ld.get('concept_up'):
         l3.append('**热点** ' + brief('concept_up', 5, '、'))
     s3 = '\n'.join(l3)
+
+    pk = sm.get('pick') or {}
+    lpk = []
+    if pk:
+        if pk.get('name'):
+            lpk.append('**推荐** %s' % (pk.get('stance') or ''))
+            lpk.append('**%s**（%s）%+.2f%%　主力净流入 %.1f亿'
+                       % (pk['name'], pk.get('kind') or '', pk.get('pct') or 0,
+                          pk.get('flow_yi') or 0))
+        else:
+            lpk.append('**推荐** %s' % (pk.get('stance') or ''))
+        for line in pk.get('lines') or []:
+            lpk.append('• ' + line)
+    spk = '\n'.join(lpk)
 
     # --- 区块 4：多空信号
     sup = [_u(x) for x in (sg.get('support') or [])]
@@ -350,6 +383,9 @@ def build_card(sm, title=None):
     if s3:
         elements += [{'tag': 'hr'},
                      {'tag': 'div', 'text': {'tag': 'lark_md', 'content': _clip(s3, 900)}}]
+    if spk.strip():
+        elements += [{'tag': 'hr'},
+                     {'tag': 'div', 'text': {'tag': 'lark_md', 'content': _clip(spk, 1800)}}]
     if s4.strip():
         elements += [{'tag': 'hr'},
                      {'tag': 'div', 'text': {'tag': 'lark_md', 'content': _clip(s4, 1400)}}]
@@ -394,7 +430,7 @@ def _add_timestamp_and_sign(body, secret=''):
     return body
 
 
-def send_feishu_webhook(webhook, card, secret='', timeout=20):
+def send_feishu_webhook(webhook, card, secret='', timeout=10):
     """飞书自定义机器人。返回 (ok, 说明)。"""
     body = {'msg_type': 'interactive', 'card': card}
     body = _add_timestamp_and_sign(body, secret)
@@ -402,7 +438,7 @@ def send_feishu_webhook(webhook, card, secret='', timeout=20):
     return _parse_feishu(txt, status)
 
 
-def send_feishu_text(webhook, text, secret='', timeout=20):
+def send_feishu_text(webhook, text, secret='', timeout=10):
     """降级用：纯文本消息。"""
     body = {'msg_type': 'text', 'content': {'text': text}}
     body = _add_timestamp_and_sign(body, secret)
@@ -433,7 +469,7 @@ def _parse_feishu(txt, status):
 
 
 def send_feishu_app(app_id, app_secret, receive_id, card, receive_id_type='open_id',
-                    timeout=20, api_base='https://open.feishu.cn'):
+                    timeout=10, api_base='https://open.feishu.cn'):
     """飞书自建应用：换 tenant_access_token 后发消息。
 
     api_base 可覆盖，便于私有化部署或本地联调。
@@ -479,7 +515,7 @@ def _replace_placeholders(data, title, content):
     return data
 
 
-def send_custom(sec, title, content, timeout=20):
+def send_custom(sec, title, content, timeout=10):
     """通用 webhook：body 里支持 {{title}} / {{content}} 占位符。
 
     占位符通过结构化递归替换，交给 json 序列化去处理转义，
@@ -541,7 +577,7 @@ def _state_write(st):
         pass
 
 
-def push(summary, cfg=None, provider=None, dry_run=False, force=False, timeout=20,
+def push(summary, cfg=None, provider=None, dry_run=False, force=False, timeout=10,
          record_state=True):
     """把摘要推送到飞书。返回 0 表示成功。
 
